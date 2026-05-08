@@ -5,3 +5,6 @@ install
 /doc/html
 tags
 .vscode
+*.log
+core
+core.*

@@ -1,0 +1,32 @@
+SOEM (Simple Open EtherCAT Master)
+Slaveinfo
+Starting slaveinfo
+ecx_init on enx00e04c1d7eb0 succeeded.
+1 slaves found and configured.
+Calculated workcounter 3
+
+Slave:1
+ Name:InoSV630N
+ Output size: 96bits
+ Input size: 224bits
+ State: 4
+ Delay: 0[ns]
+ Has DC: 1
+ DCParentport:0
+ Activeports:1.0.0.0
+ Configured address: 1001
+ Man: 00100000 ID: 000c0112 Rev: 00010000
+ SM0 A:1000 L: 256 F:00010026 Type:1
+ SM1 A:1400 L: 256 F:00010022 Type:2
+ SM2 A:1800 L:  12 F:00010064 Type:3
+ SM3 A:1c00 L:  28 F:00010020 Type:4
+ FMMU0 Ls:00000000 Ll:  12 Lsb:0 Leb:7 Ps:1800 Psb:0 Ty:02 Act:01
+ FMMU1 Ls:0000000c Ll:  28 Lsb:0 Leb:7 Ps:1c00 Psb:0 Ty:01 Act:01
+ FMMU2 Ls:00000028 Ll:   1 Lsb:0 Leb:7 Ps:080d Psb:0 Ty:01 Act:01
+ FMMUfunc 0:1 1:2 2:3 3:0
+ MBX length wr: 256 rd: 256 MBX protocols : 06
+ CoE details: 0d FoE details: 00 EoE details: 02 SoE details: 00
+ Ebus current: 0[mA]
+ only LRD/LWR:0
+End slaveinfo, close socket
+End program

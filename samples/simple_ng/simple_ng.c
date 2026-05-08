@@ -12,6 +12,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define FIELD_BUS_CYCLE_NS 1000000
+#define FIELD_BUS_CYCLE_US (FIELD_BUS_CYCLE_NS / 1000)
+#define FIELD_BUS_OP_TRIES 500
+
 typedef struct
 {
    ecx_contextt context;
@@ -51,6 +55,75 @@ fieldbus_roundtrip(Fieldbus *fieldbus)
    return wkc;
 }
 
+static void
+fieldbus_print_errors(ecx_contextt *context)
+{
+   while (context->ecaterror)
+   {
+      printf("%s", ecx_elist2string(context));
+   }
+}
+
+static void
+fieldbus_run_cycles(Fieldbus *fieldbus, int cycles)
+{
+   int i;
+
+   for (i = 0; i < cycles; ++i)
+   {
+      fieldbus_roundtrip(fieldbus);
+      osal_usleep(FIELD_BUS_CYCLE_US);
+   }
+}
+
+static void
+fieldbus_configure_sync_mode(ecx_contextt *context)
+{
+   uint16 sync0_mode;
+   uint16 value;
+   int size;
+   int wkc;
+   int i;
+
+   sync0_mode = htoes(2); /* SM synchronization type: DC Sync0 */
+   for (i = 1; i <= context->slavecount; ++i)
+   {
+      ec_slavet *slave = context->slavelist + i;
+      if ((slave->mbx_proto & ECT_MBXPROT_COE) == 0)
+      {
+         continue;
+      }
+
+      wkc = ecx_SDOwrite(context, i, 0x1c32, 0x01, FALSE,
+                         sizeof(sync0_mode), &sync0_mode, EC_TIMEOUTRXM);
+      printf(" slave %d SM2 write=%d", i, wkc);
+      fieldbus_print_errors(context);
+
+      wkc = ecx_SDOwrite(context, i, 0x1c33, 0x01, FALSE,
+                         sizeof(sync0_mode), &sync0_mode, EC_TIMEOUTRXM);
+      printf(" SM3 write=%d", wkc);
+      fieldbus_print_errors(context);
+
+      size = sizeof(value);
+      value = 0;
+      wkc = ecx_SDOread(context, i, 0x1c32, 0x01, FALSE, &size, &value, EC_TIMEOUTRXM);
+      if (wkc > 0)
+      {
+         printf(" SM2=%u", etohs(value));
+      }
+      fieldbus_print_errors(context);
+
+      size = sizeof(value);
+      value = 0;
+      wkc = ecx_SDOread(context, i, 0x1c33, 0x01, FALSE, &size, &value, EC_TIMEOUTRXM);
+      if (wkc > 0)
+      {
+         printf(" SM3=%u", etohs(value));
+      }
+      fieldbus_print_errors(context);
+   }
+}
+
 static boolean
 fieldbus_start(Fieldbus *fieldbus)
 {
@@ -78,6 +151,8 @@ fieldbus_start(Fieldbus *fieldbus)
    }
    printf("%d slaves found\n", context->slavecount);
 
+   context->manualstatechange = 1;
+
    printf("Sequential mapping of I/O... ");
    ecx_config_map_group(context, fieldbus->map, fieldbus->group);
    printf("mapped %dO+%dI bytes from %d segments",
@@ -93,16 +168,51 @@ fieldbus_start(Fieldbus *fieldbus)
    }
    printf("\n");
 
+   printf("Configuring sync manager mode...");
+   fieldbus_configure_sync_mode(context);
+   printf(" done\n");
+
    printf("Configuring distributed clock... ");
    ecx_configdc(context);
+   for (i = 1; i <= context->slavecount; ++i)
+   {
+      slave = context->slavelist + i;
+      if (slave->hasdc)
+      {
+         ecx_dcsync0(context, i, TRUE, FIELD_BUS_CYCLE_NS, 0);
+         printf(" slave %d SYNC0=%dns", i, FIELD_BUS_CYCLE_NS);
+      }
+   }
    printf("done\n");
 
    printf("Waiting for all slaves in safe operational... ");
+   context->slavelist[0].state = EC_STATE_SAFE_OP;
+   ecx_writestate(context, 0);
    ecx_statecheck(context, 0, EC_STATE_SAFE_OP, EC_TIMEOUTSTATE * 4);
-   printf("done\n");
+   if (context->slavelist[0].state == EC_STATE_SAFE_OP)
+   {
+      printf("done\n");
+   }
+   else
+   {
+      printf("failed,");
+      ecx_readstate(context);
+      for (i = 1; i <= context->slavecount; ++i)
+      {
+         slave = context->slavelist + i;
+         if (slave->state != EC_STATE_SAFE_OP)
+         {
+            printf(" slave %d is 0x%04X (AL-status=0x%04X %s)",
+                   i, slave->state, slave->ALstatuscode,
+                   ec_ALstatuscode2string(slave->ALstatuscode));
+         }
+      }
+      printf("\n");
+      return FALSE;
+   }
 
-   printf("Send a roundtrip to make outputs in slaves happy... ");
-   fieldbus_roundtrip(fieldbus);
+   printf("Run process data before operational... ");
+   fieldbus_run_cycles(fieldbus, 200);
    printf("done\n");
 
    printf("Setting operational state..");
@@ -110,17 +220,17 @@ fieldbus_start(Fieldbus *fieldbus)
    slave = context->slavelist;
    slave->state = EC_STATE_OPERATIONAL;
    ecx_writestate(context, 0);
-   /* Poll the result ten times before giving up */
-   for (i = 0; i < 10; ++i)
+   for (i = 0; i < FIELD_BUS_OP_TRIES; ++i)
    {
       printf(".");
       fieldbus_roundtrip(fieldbus);
-      ecx_statecheck(context, 0, EC_STATE_OPERATIONAL, EC_TIMEOUTSTATE / 10);
+      ecx_statecheck(context, 0, EC_STATE_OPERATIONAL, FIELD_BUS_CYCLE_US);
       if (slave->state == EC_STATE_OPERATIONAL)
       {
          printf(" all slaves are now operational\n");
          return TRUE;
       }
+      osal_usleep(FIELD_BUS_CYCLE_US);
    }
 
    printf(" failed,");
@@ -151,6 +261,13 @@ fieldbus_stop(Fieldbus *fieldbus)
    slave = context->slavelist;
 
    printf("Requesting init state on all slaves... ");
+   for (uint16 i = 1; i <= context->slavecount; ++i)
+   {
+      if (context->slavelist[i].DCactive)
+      {
+         ecx_dcsync0(context, i, FALSE, 0, 0);
+      }
+   }
    slave->state = EC_STATE_INIT;
    ecx_writestate(context, 0);
    printf("done\n");

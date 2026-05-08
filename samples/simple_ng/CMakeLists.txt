@@ -1,3 +1,5 @@
 add_executable(simple_ng simple_ng.c)
 target_link_libraries(simple_ng soem)
-install(TARGETS simple_ng DESTINATION bin)
+add_executable(servo_cli servo_cli.c)
+target_link_libraries(servo_cli soem)
+install(TARGETS simple_ng servo_cli DESTINATION bin)
