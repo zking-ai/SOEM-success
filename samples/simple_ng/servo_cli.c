@@ -8,6 +8,7 @@
  *   servo_cli IFACE fault-reset
  *   servo_cli IFACE move POS
  *   servo_cli IFACE mover DELTA
+ *   servo_cli IFACE vel VELOCITY
  */
 
 #include "soem/soem.h"
@@ -22,8 +23,11 @@
 #define DEFAULT_CYCLE_US 1000
 #define IO_MAP_SIZE 4096
 #define NSEC_PER_SEC 1000000000
+#define MODE_CSP 8
+#define MODE_CSV 9
 
 static volatile sig_atomic_t keep_running = 1;
+static volatile int csv_pdo_remap_ok = 0;
 
 typedef struct
 {
@@ -43,6 +47,8 @@ typedef struct
    PdoEntry actual_position;      /* 0x6064:00 */
    PdoEntry target_velocity;      /* 0x60ff:00 */
    PdoEntry target_torque;        /* 0x6071:00 */
+   PdoEntry digital_outputs;      /* 0x60fe:01 */
+   PdoEntry max_profile_velocity; /* 0x607f:00 */
 } ServoMap;
 
 typedef struct
@@ -58,6 +64,8 @@ typedef struct
    int bad_wkc;
    uint32 cycle_us;
    uint32 cycle_ns;
+   int8 requested_mode;
+   int mode_requested;
 } ServoBus;
 
 static void handle_signal(int signal)
@@ -161,6 +169,12 @@ static void set_entry(PdoEntry *entry, int bit_offset, int bit_length)
 static void remember_pdo_entry(ServoMap *map, uint16 index, uint8 subindex,
                                int bit_offset, int bit_length)
 {
+   if (index == 0x60fe && subindex == 1)
+   {
+      set_entry(&map->digital_outputs, bit_offset, bit_length);
+      return;
+   }
+
    if (subindex != 0)
    {
       return;
@@ -194,6 +208,9 @@ static void remember_pdo_entry(ServoMap *map, uint16 index, uint8 subindex,
       break;
    case 0x6071:
       set_entry(&map->target_torque, bit_offset, bit_length);
+      break;
+   case 0x607f:
+      set_entry(&map->max_profile_velocity, bit_offset, bit_length);
       break;
    default:
       break;
@@ -307,6 +324,25 @@ static void write_i32(ec_slavet *slave, const PdoEntry *entry, int32 value)
    }
 }
 
+static void write_i8(ec_slavet *slave, const PdoEntry *entry, int8 value)
+{
+   uint8 *p = entry_ptr(slave, entry, 1);
+   if (p && entry->bit_length == 8)
+   {
+      memcpy(p, &value, sizeof(value));
+   }
+}
+
+static void write_u32(ec_slavet *slave, const PdoEntry *entry, uint32 value)
+{
+   uint8 *p = entry_ptr(slave, entry, 1);
+   if (p && entry->bit_length == 32)
+   {
+      uint32 v = htoel(value);
+      memcpy(p, &v, sizeof(v));
+   }
+}
+
 static uint16 read_u16(ec_slavet *slave, const PdoEntry *entry)
 {
    uint8 *p = entry_ptr(slave, entry, 0);
@@ -315,6 +351,17 @@ static uint16 read_u16(ec_slavet *slave, const PdoEntry *entry)
    {
       memcpy(&value, p, sizeof(value));
       value = etohs(value);
+   }
+   return value;
+}
+
+static int8 read_i8(ec_slavet *slave, const PdoEntry *entry)
+{
+   uint8 *p = entry_ptr(slave, entry, 0);
+   int8 value = 0;
+   if (p && entry->bit_length == 8)
+   {
+      memcpy(&value, p, sizeof(value));
    }
    return value;
 }
@@ -365,6 +412,26 @@ static int sdo_read_u32(ecx_contextt *context, uint16 index, uint8 subindex, uin
    return 1;
 }
 
+static int sdo_write_u8(ecx_contextt *context, uint16 index, uint8 subindex, uint8 value)
+{
+   return ecx_SDOwrite(context, SERVO_SLAVE, index, subindex, FALSE,
+                       sizeof(value), &value, EC_TIMEOUTRXM) > 0;
+}
+
+static int sdo_write_u16(ecx_contextt *context, uint16 index, uint8 subindex, uint16 value)
+{
+   uint16 v = htoes(value);
+   return ecx_SDOwrite(context, SERVO_SLAVE, index, subindex, FALSE,
+                       sizeof(v), &v, EC_TIMEOUTRXM) > 0;
+}
+
+static int sdo_write_u32(ecx_contextt *context, uint16 index, uint8 subindex, uint32 value)
+{
+   uint32 v = htoel(value);
+   return ecx_SDOwrite(context, SERVO_SLAVE, index, subindex, FALSE,
+                       sizeof(v), &v, EC_TIMEOUTRXM) > 0;
+}
+
 static const char *cia402_state(uint16 sw)
 {
    if (sw & 0x0008) return "fault";
@@ -382,11 +449,10 @@ static int is_operation_enabled(uint16 sw)
 }
 
 static void print_pdo_status(ServoBus *bus);
-static void write_do_u32(ec_slavet *slave, uint32 value)
+static void write_do_u32(ServoBus *bus, uint32 value)
 {
-   /* Digital outputs 0x60fe:01 is mapped at bit 64 in the RxPDO (12 bytes total) */
-   uint32 v = htoel(value);
-   memcpy(slave->outputs + 8, &v, sizeof(v));
+   ec_slavet *slave = &bus->context.slavelist[SERVO_SLAVE];
+   write_u32(slave, &bus->map.digital_outputs, value);
 }
 
 static void prepare_safe_targets(ServoBus *bus)
@@ -406,6 +472,10 @@ static void prepare_safe_targets(ServoBus *bus)
    {
       write_u16(slave, &bus->map.target_torque, 0);
    }
+   if (bus->mode_requested && bus->map.modes_of_operation.present)
+   {
+      write_i8(slave, &bus->map.modes_of_operation, bus->requested_mode);
+   }
 }
 
 /*
@@ -422,7 +492,7 @@ static int wait_status(ServoBus *bus, uint16 controlword, uint16 mask, uint16 va
    {
       uint16 sw;
       write_u16(slave, &bus->map.controlword, controlword);
-      write_do_u32(slave, 0x00000001);
+      write_do_u32(bus, 0x00000001);
       prepare_safe_targets(bus);
       if (!bus->cyclic_run)
       {
@@ -465,7 +535,7 @@ static void servo_diagnose(ServoBus *bus)
    print_errors(context);
 }
 
-static int servo_enable(ServoBus *bus)
+static int servo_enable(ServoBus *bus, int8 requested_mode)
 {
    ecx_contextt *context = &bus->context;
    ec_slavet *slave = &bus->context.slavelist[SERVO_SLAVE];
@@ -474,6 +544,9 @@ static int servo_enable(ServoBus *bus)
    int size;
    int i;
 
+   bus->requested_mode = requested_mode;
+   bus->mode_requested = 1;
+
    /*
     * When the cyclic thread is already running, do NOT call roundtrip()
     * from the main thread — that would conflict on the EtherCAT socket.
@@ -481,7 +554,7 @@ static int servo_enable(ServoBus *bus)
     * handle PDO exchange.
     */
    prepare_safe_targets(bus);
-   write_do_u32(slave, 0x00000001);
+   write_do_u32(bus, 0x00000001);
    if (!bus->cyclic_run)
    {
       roundtrip(bus);
@@ -518,17 +591,15 @@ static int servo_enable(ServoBus *bus)
    }
    print_pdo_status(bus);
 
-   /* Set mode of operation while in ready-to-switch-on state */
+   /* Set mode of operation while in ready-to-switch-on state. */
    size = sizeof(mode);
-   if (sdo_read_u8(context, 0x6060, 0x00, (uint8 *)&mode) && mode == 0)
-   {
-      mode = 8; /* CSP = Cyclic Synchronous Position */
-      printf("Setting mode of operation to CSP (8)\n");
-      ecx_SDOwrite(context, SERVO_SLAVE, 0x6060, 0x00, FALSE,
-                   sizeof(mode), &mode, EC_TIMEOUTRXM);
-      print_errors(context);
-      run_cycles(bus, 10);
-   }
+   mode = requested_mode;
+   printf("Setting mode of operation to %s (%d)\n",
+          requested_mode == MODE_CSV ? "CSV" : "CSP", requested_mode);
+   ecx_SDOwrite(context, SERVO_SLAVE, 0x6060, 0x00, FALSE,
+                size, &mode, EC_TIMEOUTRXM);
+   print_errors(context);
+   run_cycles(bus, 20);
 
    printf("Switch on\n");
    if (!wait_status(bus, 0x0007, 0x006f, 0x0023, 1000))
@@ -539,7 +610,7 @@ static int servo_enable(ServoBus *bus)
    print_pdo_status(bus);
 
    printf("Setting digital outputs to 0x1\n");
-   write_do_u32(slave, 0x00000001);
+   write_do_u32(bus, 0x00000001);
    run_cycles(bus, 10);
 
    printf("Enable operation\n");
@@ -552,7 +623,7 @@ static int servo_enable(ServoBus *bus)
          return 1;
       }
       printf("  Enable attempt %d failed, retrying...\n", i + 1);
-      write_do_u32(slave, 0x00000001);
+      write_do_u32(bus, 0x00000001);
    }
 
    printf("Enable operation did not reach operation-enabled\n");
@@ -562,6 +633,8 @@ static int servo_enable(ServoBus *bus)
 }
 
 #define MAX_DELTA 100000
+#define MAX_VELOCITY 100000
+#define DEFAULT_VELOCITY_ACCEL 10000 /* velocity units per second^2 */
 #define DEFAULT_SPEED 100  /* pulses per ms */
 
 static void servo_disable(ServoBus *bus)
@@ -624,13 +697,123 @@ static void motor_move_smooth(ServoBus *bus, int32 delta, int32 speed)
          start_pos += step;
          write_i32(slave, &bus->map.target_position, start_pos);
       }
-      write_do_u32(slave, 0x00000001);
+      write_do_u32(bus, 0x00000001);
       write_u16(slave, &bus->map.controlword, 0x000f);
       osal_usleep(bus->cycle_us);
    }
 
    printf("Move complete, actual position: %d\n",
           read_i32(slave, &bus->map.actual_position));
+}
+
+static void motor_run_velocity(ServoBus *bus, int32 velocity)
+{
+   ec_slavet *slave = &bus->context.slavelist[SERVO_SLAVE];
+   int32 command_velocity;
+   int32 ramp_step;
+   int32 max_velocity;
+
+   if (!bus->map.target_velocity.present)
+   {
+      printf("Required PDO entry 0x60FF target velocity is not mapped\n");
+      return;
+   }
+
+   command_velocity = 0;
+   ramp_step = (int32)(((int64)DEFAULT_VELOCITY_ACCEL * bus->cycle_us) / 1000000);
+   if (ramp_step < 1)
+   {
+      ramp_step = 1;
+   }
+   max_velocity = velocity < 0 ? -velocity : velocity;
+   if (bus->map.max_profile_velocity.present)
+   {
+      write_i32(slave, &bus->map.max_profile_velocity, max_velocity);
+   }
+
+   printf("Velocity run: target_velocity=%d, accel=%d/s^2. Press Ctrl-C to stop.\n",
+          velocity, DEFAULT_VELOCITY_ACCEL);
+   signal(SIGINT, handle_signal);
+   signal(SIGTERM, handle_signal);
+
+   while (keep_running)
+   {
+      uint16 sw = read_u16(slave, &bus->map.statusword);
+      if (sw & 0x0008)
+      {
+         printf("* FAULT during velocity run (statusword=0x%04x, error=0x%04x) - stopping\n",
+                sw, read_u16(slave, &bus->map.error_code));
+         break;
+      }
+      if (!is_operation_enabled(sw))
+      {
+         printf("Not operation-enabled (0x%04x: %s)\n", sw, cia402_state(sw));
+         break;
+      }
+
+      if (command_velocity < velocity)
+      {
+         command_velocity += ramp_step;
+         if (command_velocity > velocity)
+         {
+            command_velocity = velocity;
+         }
+      }
+      else if (command_velocity > velocity)
+      {
+         command_velocity -= ramp_step;
+         if (command_velocity < velocity)
+         {
+            command_velocity = velocity;
+         }
+      }
+
+      if (bus->map.modes_of_operation.present)
+      {
+         write_i8(slave, &bus->map.modes_of_operation, MODE_CSV);
+      }
+      if (bus->map.max_profile_velocity.present)
+      {
+         write_i32(slave, &bus->map.max_profile_velocity, max_velocity);
+      }
+      write_i32(slave, &bus->map.target_velocity, command_velocity);
+      write_u16(slave, &bus->map.controlword, 0x000f);
+      write_do_u32(bus, 0x00000001);
+      osal_usleep(bus->cycle_us);
+   }
+
+   printf("Stopping velocity\n");
+   while (command_velocity != 0)
+   {
+      if (command_velocity > 0)
+      {
+         command_velocity -= ramp_step;
+         if (command_velocity < 0)
+         {
+            command_velocity = 0;
+         }
+      }
+      else
+      {
+         command_velocity += ramp_step;
+         if (command_velocity > 0)
+         {
+            command_velocity = 0;
+         }
+      }
+      if (bus->map.modes_of_operation.present)
+      {
+         write_i8(slave, &bus->map.modes_of_operation, MODE_CSV);
+      }
+      write_i32(slave, &bus->map.target_velocity, command_velocity);
+      write_u16(slave, &bus->map.controlword, 0x000f);
+      write_do_u32(bus, 0x00000001);
+      osal_usleep(bus->cycle_us);
+   }
+   write_i32(slave, &bus->map.target_velocity, 0);
+   write_u16(slave, &bus->map.controlword, 0x000f);
+   write_do_u32(bus, 0x00000001);
+   run_cycles(bus, 200);
 }
 
 static void servo_fault_reset(ServoBus *bus)
@@ -714,6 +897,10 @@ static void print_pdo_status(ServoBus *bus)
    {
       printf(" Pos: %d", read_i32(slave, &bus->map.actual_position));
    }
+   if (bus->map.mode_display.present)
+   {
+      printf(" Mode: %d", read_i8(slave, &bus->map.mode_display));
+   }
    printf(" WKC: %d bad:%d\n", bus->wkc, bus->bad_wkc);
 }
 
@@ -740,7 +927,263 @@ static int configure_sync_mode(ecx_contextt *context, uint32 cycle_ns)
    return ok;
 }
 
-static int bus_start(ServoBus *bus, const char *iface, uint32 cycle_us)
+static void discard_errors(ecx_contextt *context)
+{
+   while (context->ecaterror)
+   {
+      (void)ecx_elist2string(context);
+   }
+}
+
+static int pdo_entry_index(uint32 mapping)
+{
+   return (int)((mapping >> 16) & 0xffff);
+}
+
+static int pdo_entries_contain(uint32 *entries, uint8 count, uint16 index)
+{
+   int i;
+   for (i = 0; i < count; ++i)
+   {
+      if (pdo_entry_index(entries[i]) == index)
+      {
+         return 1;
+      }
+   }
+   return 0;
+}
+
+static int read_pdo_entries(ecx_contextt *context, uint16 pdo_index,
+                            uint32 *entries, uint8 max_entries, uint8 *entry_count)
+{
+   int size;
+   int i;
+
+   size = sizeof(*entry_count);
+   *entry_count = 0;
+   if (ecx_SDOread(context, SERVO_SLAVE, pdo_index, 0x00, FALSE,
+                   &size, entry_count, EC_TIMEOUTRXM) <= 0)
+   {
+      return 0;
+   }
+   if (*entry_count > max_entries)
+   {
+      return 0;
+   }
+
+   for (i = 0; i < *entry_count; ++i)
+   {
+      size = sizeof(entries[i]);
+      entries[i] = 0;
+      if (ecx_SDOread(context, SERVO_SLAVE, pdo_index, (uint8)(i + 1), FALSE,
+                      &size, &entries[i], EC_TIMEOUTRXM) <= 0)
+      {
+         return 0;
+      }
+      entries[i] = etohl(entries[i]);
+   }
+   return 1;
+}
+
+static int assign_rxpdo(ecx_contextt *context, uint16 pdo_index,
+                        uint16 *original_assignments, uint8 original_count)
+{
+   int ok;
+   int i;
+
+   ok = 1;
+   if (!sdo_write_u8(context, 0x1c12, 0x00, 0)) ok = 0;
+   if (ok && !sdo_write_u16(context, 0x1c12, 0x01, pdo_index)) ok = 0;
+   if (ok && !sdo_write_u8(context, 0x1c12, 0x00, 1)) ok = 0;
+   print_errors(context);
+
+   if (ok)
+   {
+      return 1;
+   }
+
+   printf("Restoring original RxPDO assignment\n");
+   sdo_write_u8(context, 0x1c12, 0x00, 0);
+   for (i = 0; i < original_count; ++i)
+   {
+      sdo_write_u16(context, 0x1c12, (uint8)(i + 1), original_assignments[i]);
+   }
+   sdo_write_u8(context, 0x1c12, 0x00, original_count);
+   print_errors(context);
+   return 0;
+}
+
+static int select_fixed_csv_rxpdo(ecx_contextt *context,
+                                  uint16 *original_assignments, uint8 original_count)
+{
+   uint32 entries[32];
+   uint8 entry_count;
+   uint16 pdo_index;
+
+   printf("Scanning fixed RxPDOs for 0x60FF target velocity\n");
+   for (pdo_index = 0x1600; pdo_index <= 0x17ff; ++pdo_index)
+   {
+      if (!read_pdo_entries(context, pdo_index, entries, 32, &entry_count))
+      {
+         discard_errors(context);
+         continue;
+      }
+      if (pdo_entries_contain(entries, entry_count, 0x6040) &&
+          pdo_entries_contain(entries, entry_count, 0x60ff))
+      {
+         printf("Found CSV-capable fixed RxPDO 0x%04x; trying assignment\n",
+                pdo_index);
+         return assign_rxpdo(context, pdo_index, original_assignments,
+                             original_count);
+      }
+   }
+
+   printf("No fixed RxPDO containing both 0x6040 and 0x60FF was found\n");
+   return 0;
+}
+
+static int configure_csv_rxpdo(ecx_contextt *context)
+{
+   uint8 assign_count;
+   uint8 original_entry_count;
+   uint16 assignments[16];
+   uint16 pdo_index;
+   uint32 original_entries[32];
+   int size;
+   int ok;
+   int assignment_disabled;
+   int mapping_cleared;
+   int i;
+
+   size = sizeof(assign_count);
+   assign_count = 0;
+   if (ecx_SDOread(context, SERVO_SLAVE, 0x1c12, 0x00, FALSE,
+                   &size, &assign_count, EC_TIMEOUTRXM) <= 0)
+   {
+      printf("Could not read RxPDO assignment 0x1C12:00\n");
+      print_errors(context);
+      return 0;
+   }
+   if (assign_count < 1)
+   {
+      printf("No RxPDO assignment found; cannot map 0x60FF\n");
+      return 0;
+   }
+   if (assign_count > 16)
+   {
+      printf("Too many RxPDO assignments (%u); refusing automatic remap\n",
+             assign_count);
+      return 0;
+   }
+
+   for (i = 0; i < assign_count; ++i)
+   {
+      size = sizeof(assignments[i]);
+      assignments[i] = 0;
+      if (ecx_SDOread(context, SERVO_SLAVE, 0x1c12, (uint8)(i + 1), FALSE,
+                      &size, &assignments[i], EC_TIMEOUTRXM) <= 0)
+      {
+         printf("Could not read RxPDO assignment 0x1C12:%02x\n", i + 1);
+         print_errors(context);
+         return 0;
+      }
+      assignments[i] = etohs(assignments[i]);
+   }
+   pdo_index = assignments[0];
+
+   size = sizeof(original_entry_count);
+   original_entry_count = 0;
+   if (ecx_SDOread(context, SERVO_SLAVE, pdo_index, 0x00, FALSE,
+                   &size, &original_entry_count, EC_TIMEOUTRXM) <= 0)
+   {
+      printf("Could not read RxPDO mapping 0x%04x:00\n", pdo_index);
+      print_errors(context);
+      return 0;
+   }
+   if (original_entry_count > 32)
+   {
+      printf("Too many RxPDO entries (%u); refusing automatic remap\n",
+             original_entry_count);
+      return 0;
+   }
+   for (i = 0; i < original_entry_count; ++i)
+   {
+      size = sizeof(original_entries[i]);
+      original_entries[i] = 0;
+      if (ecx_SDOread(context, SERVO_SLAVE, pdo_index, (uint8)(i + 1), FALSE,
+                      &size, &original_entries[i], EC_TIMEOUTRXM) <= 0)
+      {
+         printf("Could not read RxPDO mapping 0x%04x:%02x\n", pdo_index, i + 1);
+         print_errors(context);
+         return 0;
+      }
+      original_entries[i] = etohl(original_entries[i]);
+   }
+   if (pdo_entries_contain(original_entries, original_entry_count, 0x6040) &&
+       pdo_entries_contain(original_entries, original_entry_count, 0x60ff))
+   {
+      printf("Current RxPDO 0x%04x already contains 0x60FF\n", pdo_index);
+      return 1;
+   }
+
+   printf("Trying CSV RxPDO mapping on 0x%04x: 6040, 60FF, 60B8, 60FE:01\n",
+          pdo_index);
+
+   ok = 1;
+   assignment_disabled = 0;
+   mapping_cleared = 0;
+   if (!sdo_write_u8(context, 0x1c12, 0x00, 0)) ok = 0;
+   else assignment_disabled = 1;
+   if (ok && !sdo_write_u8(context, pdo_index, 0x00, 0)) ok = 0;
+   else if (ok) mapping_cleared = 1;
+   if (ok && !sdo_write_u32(context, pdo_index, 0x01, 0x60400010)) ok = 0;
+   if (ok && !sdo_write_u32(context, pdo_index, 0x02, 0x60ff0020)) ok = 0;
+   if (ok && !sdo_write_u32(context, pdo_index, 0x03, 0x60b80010)) ok = 0;
+   if (ok && !sdo_write_u32(context, pdo_index, 0x04, 0x60fe0120)) ok = 0;
+   if (ok && !sdo_write_u8(context, pdo_index, 0x00, 4)) ok = 0;
+   if (ok && !sdo_write_u16(context, 0x1c12, 0x01, pdo_index)) ok = 0;
+   if (ok && !sdo_write_u8(context, 0x1c12, 0x00, 1)) ok = 0;
+   print_errors(context);
+
+   if (!ok)
+   {
+      printf("CSV RxPDO remap failed; drive may reject dynamic PDO mapping.\n");
+      if (mapping_cleared)
+      {
+         printf("Restoring original RxPDO mapping\n");
+         sdo_write_u8(context, pdo_index, 0x00, 0);
+         for (i = 0; i < original_entry_count; ++i)
+         {
+            sdo_write_u32(context, pdo_index, (uint8)(i + 1), original_entries[i]);
+         }
+         sdo_write_u8(context, pdo_index, 0x00, original_entry_count);
+      }
+      if (assignment_disabled)
+      {
+         for (i = 0; i < assign_count; ++i)
+         {
+            sdo_write_u16(context, 0x1c12, (uint8)(i + 1), assignments[i]);
+         }
+         sdo_write_u8(context, 0x1c12, 0x00, assign_count);
+      }
+      print_errors(context);
+      return select_fixed_csv_rxpdo(context, assignments, assign_count);
+   }
+   printf("CSV RxPDO remap accepted\n");
+   return 1;
+}
+
+static int csv_pdo_config_callback(ecx_contextt *context, uint16 slave)
+{
+   if (slave != SERVO_SLAVE)
+   {
+      return 0;
+   }
+   csv_pdo_remap_ok = configure_csv_rxpdo(context);
+   return csv_pdo_remap_ok;
+}
+
+static int bus_start(ServoBus *bus, const char *iface, uint32 cycle_us, int request_csv_pdo)
 {
    ecx_contextt *context = &bus->context;
    ec_groupt *group = &context->grouplist[0];
@@ -774,6 +1217,12 @@ static int bus_start(ServoBus *bus, const char *iface, uint32 cycle_us)
    }
 
    context->manualstatechange = 1;
+   csv_pdo_remap_ok = 0;
+   if (request_csv_pdo)
+   {
+      context->slavelist[SERVO_SLAVE].PO2SOconfig = csv_pdo_config_callback;
+   }
+
    ecx_config_map_group(context, bus->iomap, 0);
    printf("Mapped %dO+%dI bytes\n", group->Obytes, group->Ibytes);
 
@@ -865,11 +1314,14 @@ static void usage(const char *name)
    printf("  %s IFACE stop [cycle_us]            Disable servo\n", name);
    printf("  %s IFACE move DELTA [cycle_us]      Enable, smooth relative move by DELTA, disable\n", name);
    printf("  %s IFACE mover DELTA [cycle_us]     Same as move\n", name);
+   printf("  %s IFACE vel VELOCITY [cycle_us]    Run at constant velocity until Ctrl-C\n", name);
    printf("  %s IFACE fault-reset [cycle_us]     Reset servo fault\n", name);
    printf("  cycle_us defaults to %d; try 2000 or 4000 in a VM if EE08.6 appears\n",
           DEFAULT_CYCLE_US);
    printf("\nInteractive commands (after start):\n");
    printf("  <delta>          Smooth relative move by delta (max +/-%d)\n", MAX_DELTA);
+   printf("  vel VELOCITY is limited to +/-%d; if 0x60FF is not mapped, unit is position-counts/s\n",
+          MAX_VELOCITY);
    printf("  a<absolute_pos>  Move to absolute position (no limit)\n");
    printf("  v<speed>         Set move speed in pulses/ms (default %d, max 1000)\n", DEFAULT_SPEED);
    printf("  s                Show status\n");
@@ -891,7 +1343,8 @@ int main(int argc, char *argv[])
 
    cmd = argv[2];
    cycle_us = DEFAULT_CYCLE_US;
-   if ((strcmp(cmd, "move") == 0) || (strcmp(cmd, "mover") == 0))
+   if ((strcmp(cmd, "move") == 0) || (strcmp(cmd, "mover") == 0) ||
+       (strcmp(cmd, "vel") == 0))
    {
       if (argc >= 5)
       {
@@ -903,7 +1356,7 @@ int main(int argc, char *argv[])
       cycle_us = (uint32)strtoul(argv[3], NULL, 0);
    }
 
-   if (!bus_start(&bus, argv[1], cycle_us))
+   if (!bus_start(&bus, argv[1], cycle_us, strcmp(cmd, "vel") == 0))
    {
       ecx_close(&bus.context);
       return 1;
@@ -915,7 +1368,7 @@ int main(int argc, char *argv[])
    }
    else if (strcmp(cmd, "start") == 0)
    {
-      ok = servo_enable(&bus);
+      ok = servo_enable(&bus, MODE_CSP);
       print_pdo_status(&bus);
       if (ok)
       {
@@ -1043,7 +1496,7 @@ int main(int argc, char *argv[])
          printf("Usage: %s IFACE %s <delta>\n", argv[0], cmd);
          ok = 0;
       }
-      else if (servo_enable(&bus))
+      else if (servo_enable(&bus, MODE_CSP))
       {
          int32 delta = (int32)strtol(argv[3], NULL, 0);
          if (abs(delta) > MAX_DELTA)
@@ -1061,6 +1514,42 @@ int main(int argc, char *argv[])
       else
       {
          ok = 0;
+      }
+   }
+   else if (strcmp(cmd, "vel") == 0)
+   {
+      if (argc < 4)
+      {
+         printf("Usage: %s IFACE vel <velocity> [cycle_us]\n", argv[0]);
+         ok = 0;
+      }
+      else
+      {
+         int32 velocity = (int32)strtol(argv[3], NULL, 0);
+         if (velocity > MAX_VELOCITY || velocity < -MAX_VELOCITY)
+         {
+            printf("SAFETY: velocity %d exceeds MAX_VELOCITY %d, rejected\n",
+                   velocity, MAX_VELOCITY);
+            ok = 0;
+         }
+         else if (bus.map.target_velocity.present)
+         {
+            if (servo_enable(&bus, MODE_CSV))
+            {
+               motor_run_velocity(&bus, velocity);
+               print_pdo_status(&bus);
+            }
+            else
+            {
+               ok = 0;
+            }
+         }
+         else
+         {
+            printf("Native CSV unavailable: 0x60FF target velocity is not mapped in RxPDO.\n");
+            printf("Check the earlier CSV RxPDO remap messages; no CSP fallback is used for vel.\n");
+            ok = 0;
+         }
       }
    }
    else if (strcmp(cmd, "stop") == 0)
