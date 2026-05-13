@@ -25,6 +25,10 @@
 #define NSEC_PER_SEC 1000000000
 #define MODE_CSP 8
 #define MODE_CSV 9
+#define MAX_DELTA 100000
+#define MAX_VELOCITY 100000
+#define DEFAULT_VELOCITY_ACCEL 10000
+#define DEFAULT_SPEED 100
 
 static volatile sig_atomic_t keep_running = 1;
 static volatile int csv_pdo_remap_ok = 0;
@@ -487,6 +491,7 @@ static void prepare_safe_targets(ServoBus *bus)
 static int wait_status(ServoBus *bus, uint16 controlword, uint16 mask, uint16 value, int cycles)
 {
    ec_slavet *slave = &bus->context.slavelist[SERVO_SLAVE];
+   uint16 last_sw = 0;
    int i;
    for (i = 0; i < cycles; ++i)
    {
@@ -502,11 +507,14 @@ static int wait_status(ServoBus *bus, uint16 controlword, uint16 mask, uint16 va
          Brief sleep to let the cyclic thread do a PDO exchange. */
       osal_usleep(bus->cycle_us);
       sw = read_u16(slave, &bus->map.statusword);
+      last_sw = sw;
       if ((sw & mask) == value)
       {
          return 1;
       }
    }
+   printf("  wait_status: last statusword=0x%04x, expected (sw & 0x%04x) == 0x%04x\n",
+          last_sw, mask, value);
    return 0;
 }
 
@@ -542,6 +550,7 @@ static int servo_enable(ServoBus *bus, int8 requested_mode)
    uint16 sw;
    int8 mode;
    int size;
+   int wkc;
    int i;
 
    bus->requested_mode = requested_mode;
@@ -583,6 +592,37 @@ static int servo_enable(ServoBus *bus, int8 requested_mode)
       printf("Fault cleared\n");
    }
 
+   /* Set mode of operation BEFORE state machine transitions.
+    * Many drives require the mode to be configured in switch-on-disabled
+    * state and will reject the mode change once in ready-to-switch-on. */
+   size = sizeof(mode);
+   mode = requested_mode;
+   printf("Setting mode of operation to %s (%d)\n",
+          requested_mode == MODE_CSV ? "CSV" : "CSP", requested_mode);
+   wkc = ecx_SDOwrite(context, SERVO_SLAVE, 0x6060, 0x00, FALSE,
+                      size, &mode, EC_TIMEOUTRXM);
+   if (wkc <= 0)
+   {
+      printf("Failed to set mode of operation via SDO\n");
+      print_errors(context);
+      return 0;
+   }
+   print_errors(context);
+   run_cycles(bus, 20);
+
+   /* Set profile velocity via SDO so the drive has a valid limit before
+      entering the state machine.  Some drives refuse to enable CSV/CSP
+      mode when max_profile_velocity is zero. */
+   if (bus->map.max_profile_velocity.present)
+   {
+      uint32 profile_vel = htoel(MAX_VELOCITY);
+      printf("Setting max profile velocity to %u\n", MAX_VELOCITY);
+      ecx_SDOwrite(context, SERVO_SLAVE, 0x607f, 0x00, FALSE,
+                   sizeof(profile_vel), &profile_vel, EC_TIMEOUTRXM);
+      print_errors(context);
+      write_i32(slave, &bus->map.max_profile_velocity, (int32)MAX_VELOCITY);
+   }
+
    printf("Shutdown\n");
    if (!wait_status(bus, 0x0006, 0x006f, 0x0021, 1000))
    {
@@ -590,16 +630,6 @@ static int servo_enable(ServoBus *bus, int8 requested_mode)
       return 0;
    }
    print_pdo_status(bus);
-
-   /* Set mode of operation while in ready-to-switch-on state. */
-   size = sizeof(mode);
-   mode = requested_mode;
-   printf("Setting mode of operation to %s (%d)\n",
-          requested_mode == MODE_CSV ? "CSV" : "CSP", requested_mode);
-   ecx_SDOwrite(context, SERVO_SLAVE, 0x6060, 0x00, FALSE,
-                size, &mode, EC_TIMEOUTRXM);
-   print_errors(context);
-   run_cycles(bus, 20);
 
    printf("Switch on\n");
    if (!wait_status(bus, 0x0007, 0x006f, 0x0023, 1000))
@@ -632,16 +662,63 @@ static int servo_enable(ServoBus *bus, int8 requested_mode)
    return 0;
 }
 
-#define MAX_DELTA 100000
-#define MAX_VELOCITY 100000
-#define DEFAULT_VELOCITY_ACCEL 10000 /* velocity units per second^2 */
-#define DEFAULT_SPEED 100  /* pulses per ms */
 
 static void servo_disable(ServoBus *bus)
 {
    ec_slavet *slave = &bus->context.slavelist[SERVO_SLAVE];
-   write_u16(slave, &bus->map.controlword, 0x0006);
-   run_cycles(bus, 200);
+   uint16 sw;
+   int i;
+
+   printf("Disabling servo\n");
+
+   /* Stop writing operation mode via PDO during disable. */
+   bus->mode_requested = 0;
+
+   sw = read_u16(slave, &bus->map.statusword);
+   if ((sw & 0x006f) == 0x0040)
+   {
+      printf("  Already in switch-on-disabled\n");
+      return;
+   }
+
+   /* Stage 1: Disable operation (0x0007), bit3 1→0.
+      Operation-enabled → Switched-on. */
+   if ((sw & 0x006f) == 0x0027)
+   {
+      printf("  Stage 1/2: disable operation → switched-on\n");
+      for (i = 0; i < 500; i++)
+      {
+         write_u16(slave, &bus->map.controlword, 0x0007);
+         osal_usleep(bus->cycle_us);
+         sw = read_u16(slave, &bus->map.statusword);
+         if ((sw & 0x006f) == 0x0033 || (sw & 0x006f) == 0x0021 || (sw & 0x006f) == 0x0040)
+         {
+            printf("  Stage 1 ok, sw=0x%04x\n", sw);
+            break;
+         }
+      }
+   }
+
+   /* Stage 2: Disable voltage (0x0000), bit1 1→0.
+      Works from Switched-on or Ready-to-switch-on.
+      Forces transition to Switch-on-disabled regardless of current state. */
+   if ((sw & 0x006f) != 0x0040)
+   {
+      printf("  Stage 2/2: disable voltage → switch-on-disabled\n");
+      for (i = 0; i < 500; i++)
+      {
+         write_u16(slave, &bus->map.controlword, 0x0000);
+         osal_usleep(bus->cycle_us);
+         sw = read_u16(slave, &bus->map.statusword);
+         if ((sw & 0x006f) == 0x0040)
+         {
+            printf("  Stage 2 ok, switch-on-disabled\n");
+            return;
+         }
+      }
+   }
+
+   printf("Warning: servo may not have fully disabled (last sw=0x%04x)\n", sw);
 }
 
 /*
@@ -1272,6 +1349,28 @@ static int bus_start(ServoBus *bus, const char *iface, uint32 cycle_us, int requ
          bus->expected_wkc = group->outputsWKC * 2 + group->inputsWKC;
          expected_wkc = bus->expected_wkc;
          printf("OP reached, expected WKC %d\n", expected_wkc);
+         /* Initialize PDO output values before starting cyclic thread.
+            Without this, the first PDO frames carry controlword=0
+            (Disable voltage + Quick stop active), locking the servo
+            in Switch-on-disabled state. */
+         {
+            ec_slavet *slave = &context->slavelist[SERVO_SLAVE];
+            write_u16(slave, &bus->map.controlword, 0x0006);
+            if (bus->map.modes_of_operation.present)
+            {
+               write_i8(slave, &bus->map.modes_of_operation, 0);
+            }
+            if (bus->map.target_velocity.present)
+            {
+               write_i32(slave, &bus->map.target_velocity, 0);
+            }
+            if (bus->map.max_profile_velocity.present)
+            {
+               write_i32(slave, &bus->map.max_profile_velocity, 0);
+            }
+            /* Do one manual roundtrip to push safe values before cyclic takes over */
+            roundtrip(bus);
+         }
          if (!start_cyclic(bus))
          {
             printf("Failed to start cyclic PDO thread\n");
