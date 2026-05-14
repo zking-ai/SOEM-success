@@ -33,9 +33,9 @@
 #define MODE_PV   3
 #define MODE_CSV  9
 
-#define MAX_VELOCITY  100000
-#define ACCEL_DEFAULT 10000
-#define DECEL_DEFAULT 10000
+#define MAX_VELOCITY  5000000
+#define ACCEL_DEFAULT 8000000
+#define DECEL_DEFAULT 8000000
 
 /* ---- state shared with signal handler ---- */
 static volatile sig_atomic_t g_running    = 1;  /* whole program */
@@ -344,8 +344,8 @@ ok:
     * takes variable time after OP is reached. */
    for (int attempt = 0; attempt < 5; attempt++) {
       if (attempt > 0) {
-         printf("Retry %d/5, waiting 500ms...\n", attempt + 1);
-         sleep_cyc(b, 500);
+         printf("Retry %d/5, waiting 1000ms...\n", attempt + 1);
+         sleep_cyc(b, 1000);
       }
 
       sw = pdo_r16(s, &b->map.statusword);
