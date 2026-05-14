@@ -342,9 +342,9 @@ ok:
     * Shutdown (0x0006) reaches ready-to-switch-on from any non-fault state.
     * Retry up to 5 times — drive internal init (power stage, encoder, DC lock)
     * takes variable time after OP is reached. */
-   for (int attempt = 0; attempt < 5; attempt++) {
+   for (int attempt = 0; attempt < 10; attempt++) {
       if (attempt > 0) {
-         printf("Retry %d/5, waiting 1000ms...\n", attempt + 1);
+         printf("Retry %d/10, waiting 1000ms...\n", attempt + 1);
          sleep_cyc(b, 1000);
       }
 
@@ -395,7 +395,7 @@ ok:
       }
       printf("  enable timeout (sw=0x%04x)\n", sw);
    }
-   printf("FAIL: could not enable after 5 attempts\n");
+   printf("FAIL: could not enable after 10 attempts\n");
    return 0;
 }
 
