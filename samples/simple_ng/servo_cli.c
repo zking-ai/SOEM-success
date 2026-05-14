@@ -292,7 +292,7 @@ static int bus_init(ServoBus *b, const char *iface, uint32 cyc_us)
             roundtrip(b);
          }
          if (!start_thread(b)) { printf("Thread fail\n"); return 0; }
-         sleep_cyc(b, 20);
+         sleep_cyc(b, 200);
          return 1;
       }
       osal_usleep(b->cycle_us);
@@ -338,54 +338,65 @@ ok:
    if (b->map.max_profile_velocity.present)
       pdo_w32(s, &b->map.max_profile_velocity, MAX_VELOCITY);
 
-   /* Force switch-on-disabled first regardless of current state.
-    * This ensures a clean CiA402 state machine start every time,
-    * preventing "FAIL switch-on" when the drive is left in a
-    * half-transitioned state from a previous incomplete shutdown. */
-   sw = pdo_r16(s, &b->map.statusword);
-   if ((sw & 0x006f) != 0x0040) {
-      printf("Force → switch-on-disabled\n");
-      for (int i = 0; i < 500; i++) {
-         pdo_w16(s, &b->map.controlword, 0x0000);
+   /* Start CiA402 state machine from current state.
+    * Shutdown (0x0006) reaches ready-to-switch-on from any non-fault state.
+    * Retry up to 5 times — drive internal init (power stage, encoder, DC lock)
+    * takes variable time after OP is reached. */
+   for (int attempt = 0; attempt < 5; attempt++) {
+      if (attempt > 0) {
+         printf("Retry %d/5, waiting 500ms...\n", attempt + 1);
+         sleep_cyc(b, 500);
+      }
+
+      sw = pdo_r16(s, &b->map.statusword);
+      printf("Attempt %d: sw=0x%04x (%s)\n", attempt + 1, sw, cia402_str(sw));
+      if (sw & 0x0008) { printf("  Fault detected, aborting\n"); return 0; }
+
+      /* state machine: shutdown → switch-on → enable-operation */
+      pdo_w32(s, &b->map.target_velocity, 0);
+
+      /* shutdown → ready-to-switch-on */
+      int ok_rts = 0;
+      for (int i = 0; i < 2000; i++) {
+         pdo_w16(s, &b->map.controlword, 0x0006);
          osal_usleep(b->cycle_us);
-         if ((pdo_r16(s, &b->map.statusword) & 0x006f) == 0x0040) break;
+         sw = pdo_r16(s, &b->map.statusword);
+         if ((sw & 0x006f) == 0x0021) { ok_rts = 1; break; }
       }
-   }
+      if (!ok_rts) { printf("  shutdown timeout (sw=0x%04x)\n", sw); continue; }
 
-   /* state machine: shutdown → switch-on → enable-operation */
-   pdo_w32(s, &b->map.target_velocity, 0);
-   pdo_w16(s, &b->map.controlword, 0x0006);
-
-   printf("Shutdown\n");
-   for (int i = 0; i < 1000; i++) {
-      pdo_w16(s, &b->map.controlword, 0x0006);
-      osal_usleep(b->cycle_us);
-      if ((pdo_r16(s, &b->map.statusword) & 0x006f) == 0x0021) goto rts;
-   }
-   printf("FAIL shutdown (sw=0x%04x)\n", pdo_r16(s, &b->map.statusword)); return 0;
-rts:
-   printf("Switch-on\n");
-   for (int i = 0; i < 1000; i++) {
-      pdo_w16(s, &b->map.controlword, 0x0007);
-      osal_usleep(b->cycle_us);
-      if ((pdo_r16(s, &b->map.statusword) & 0x006f) == 0x0023) goto so;
-   }
-   printf("FAIL switch-on (sw=0x%04x)\n", pdo_r16(s, &b->map.statusword)); return 0;
-so:
-   printf("Enable operation...\n");
-   pdo_w32(s, &b->map.target_velocity, 0);
-   for (int i = 0; i < 1000; i++) {
-      pdo_w16(s, &b->map.controlword, 0x000f);
-      osal_usleep(b->cycle_us);
-      if (is_oe(pdo_r16(s, &b->map.statusword))) {
-         printf("Enabled (OP), sw=0x%04x\n", pdo_r16(s, &b->map.statusword));
-         /* write PV mode into PDO so the cyclic thread sends it every cycle */
-         if (b->map.modes_of_operation.present)
-            pdo_w8(s, &b->map.modes_of_operation, MODE_PV);
-         return 1;
+      /* switch-on → switched-on */
+      int ok_so = 0;
+      for (int i = 0; i < 2000; i++) {
+         pdo_w16(s, &b->map.controlword, 0x0007);
+         osal_usleep(b->cycle_us);
+         sw = pdo_r16(s, &b->map.statusword);
+         if ((sw & 0x006f) == 0x0023) { ok_so = 1; break; }
       }
+      if (!ok_so) { printf("  switch-on timeout (sw=0x%04x)\n", sw); continue; }
+
+      /* enable-operation → operation-enabled */
+      pdo_w32(s, &b->map.target_velocity, 0);
+      for (int i = 0; i < 2000; i++) {
+         pdo_w16(s, &b->map.controlword, 0x000f);
+         osal_usleep(b->cycle_us);
+         sw = pdo_r16(s, &b->map.statusword);
+         if (sw & 0x0008) {
+            printf("  FAULT during enable (sw=0x%04x err=0x%04x)\n",
+                   sw, b->map.error_code.present ? pdo_r16(s, &b->map.error_code) : 0);
+            return 0;
+         }
+         if (is_oe(sw)) {
+            printf("Enabled (OP), sw=0x%04x\n", sw);
+            if (b->map.modes_of_operation.present)
+               pdo_w8(s, &b->map.modes_of_operation, MODE_PV);
+            return 1;
+         }
+      }
+      printf("  enable timeout (sw=0x%04x)\n", sw);
    }
-   printf("FAIL enable-operation\n"); return 0;
+   printf("FAIL: could not enable after 5 attempts\n");
+   return 0;
 }
 
 /* ---- PV velocity run ---- */
